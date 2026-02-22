@@ -19,6 +19,8 @@
 
 #include "armv7a.h"
 
+struct arm_cti;
+
 #define CORTEX_A_COMMON_MAGIC 0x411fc082U
 
 #define CORTEX_A5_PARTNUM 0xc05
@@ -101,6 +103,7 @@ struct cortex_a_common {
 
 	enum cortex_a_isrmasking_mode isrmasking_mode;
 	enum cortex_a_dacrfixup_mode dacrfixup_mode;
+	struct arm_cti *cti;
 };
 
 static inline struct cortex_a_common *
