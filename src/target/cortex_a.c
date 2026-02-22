@@ -46,6 +46,7 @@
 #include "target_request.h"
 #include "target_type.h"
 #include "arm_coresight.h"
+#include "arm_cti.h"
 #include "arm_opcodes.h"
 #include "arm_semihosting.h"
 #include "jtag/interface.h"
@@ -55,6 +56,11 @@
 #include <helper/nvp.h>
 #include <helper/time_support.h>
 #include <helper/align.h>
+
+struct cortex_a_private_config {
+	struct adiv5_private_config adiv5_config;
+	struct arm_cti *cti;
+};
 
 static int cortex_a_poll(struct target *target);
 static int cortex_a_debug_entry(struct target *target);
@@ -2968,6 +2974,18 @@ static int cortex_a_handle_target_request(void *priv)
 }
 
 /*
+ * private target configuration items
+ */
+enum cortex_a_cfg_param {
+	CFG_CTI,
+};
+
+static const struct jim_nvp nvp_config_opts[] = {
+	{ .name = "-cti", .value = CFG_CTI },
+	{ .name = NULL, .value = -1 }
+};
+
+/*
  * Cortex-A target information and configuration
  */
 
@@ -2976,14 +2994,14 @@ static int cortex_a_examine_first(struct target *target)
 	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
 	struct armv7a_common *armv7a = &cortex_a->armv7a_common;
 	struct adiv5_dap *swjdp = armv7a->arm.dap;
-	struct adiv5_private_config *pc = target->private_config;
+	struct cortex_a_private_config *pc = target->private_config;
 
 	int i;
 	int retval = ERROR_OK;
 	uint32_t didr, cpuid, dbg_osreg, dbg_idpfr1;
 
 	if (!armv7a->debug_ap) {
-		if (pc->ap_num == DP_APSEL_INVALID) {
+		if (pc->adiv5_config.ap_num == DP_APSEL_INVALID) {
 			/* Search for the APB-AP - it is needed for access to debug registers */
 			retval = dap_find_get_ap(swjdp, AP_TYPE_APB_AP, &armv7a->debug_ap);
 			if (retval != ERROR_OK) {
@@ -2991,7 +3009,7 @@ static int cortex_a_examine_first(struct target *target)
 				return retval;
 			}
 		} else {
-			armv7a->debug_ap = dap_get_ap(swjdp, pc->ap_num);
+			armv7a->debug_ap = dap_get_ap(swjdp, pc->adiv5_config.ap_num);
 			if (!armv7a->debug_ap) {
 				LOG_ERROR("Cannot get AP");
 				return ERROR_FAIL;
@@ -3045,6 +3063,12 @@ static int cortex_a_examine_first(struct target *target)
 
 	cortex_a->didr = didr;
 	cortex_a->cpuid = cpuid;
+
+	cortex_a->cti = pc->cti;
+	if (target->smp && armv7a->is_armv7r && !cortex_a->cti) {
+		LOG_TARGET_ERROR(target, "CTI not specified for SMP Cortex-R target");
+		return ERROR_FAIL;
+	}
 
 	retval = mem_ap_read_atomic_u32(armv7a->debug_ap,
 				    armv7a->debug_base + CPUDBG_PRSR, &dbg_osreg);
@@ -3214,12 +3238,14 @@ static int cortex_a_init_arch_info(struct target *target,
 static int cortex_a_target_create(struct target *target)
 {
 	struct cortex_a_common *cortex_a;
-	struct adiv5_private_config *pc;
+	struct cortex_a_private_config *pc;
 
 	if (!target->private_config)
 		return ERROR_FAIL;
 
-	pc = (struct adiv5_private_config *)target->private_config;
+	pc = (struct cortex_a_private_config *)target->private_config;
+	if (adiv5_verify_config(&pc->adiv5_config) != ERROR_OK)
+		return ERROR_FAIL;
 
 	cortex_a = calloc(1, sizeof(struct cortex_a_common));
 	if (!cortex_a) {
@@ -3230,16 +3256,16 @@ static int cortex_a_target_create(struct target *target)
 	cortex_a->armv7a_common.is_armv7r = false;
 	cortex_a->armv7a_common.arm.arm_vfp_version = ARM_VFP_V3;
 
-	return cortex_a_init_arch_info(target, cortex_a, pc->dap);
+	return cortex_a_init_arch_info(target, cortex_a, pc->adiv5_config.dap);
 }
 
 static int cortex_r4_target_create(struct target *target)
 {
 	struct cortex_a_common *cortex_a;
-	struct adiv5_private_config *pc;
+	struct cortex_a_private_config *pc;
 
-	pc = (struct adiv5_private_config *)target->private_config;
-	if (adiv5_verify_config(pc) != ERROR_OK)
+	pc = (struct cortex_a_private_config *)target->private_config;
+	if (adiv5_verify_config(&pc->adiv5_config) != ERROR_OK)
 		return ERROR_FAIL;
 
 	cortex_a = calloc(1, sizeof(struct cortex_a_common));
@@ -3250,7 +3276,7 @@ static int cortex_r4_target_create(struct target *target)
 	cortex_a->common_magic = CORTEX_A_COMMON_MAGIC;
 	cortex_a->armv7a_common.is_armv7r = true;
 
-	return cortex_a_init_arch_info(target, cortex_a, pc->dap);
+	return cortex_a_init_arch_info(target, cortex_a, pc->adiv5_config.dap);
 }
 
 static void cortex_a_deinit_target(struct target *target)
@@ -3324,6 +3350,74 @@ static int cortex_a_virt2phys(struct target *target,
 		return retval;
 	return armv7a_mmu_translate_va_pa(target, (uint32_t)virt,
 						    phys, 1);
+}
+
+static int cortex_a_jim_configure(struct target *target, struct jim_getopt_info *goi)
+{
+	struct cortex_a_private_config *pc;
+	struct jim_nvp *n;
+	int e;
+
+	pc = (struct cortex_a_private_config *)target->private_config;
+	if (!pc) {
+		pc = calloc(1, sizeof(struct cortex_a_private_config));
+		pc->adiv5_config.ap_num = DP_APSEL_INVALID;
+		target->private_config = pc;
+	}
+
+	e = adiv5_jim_configure_ext(target, goi, &pc->adiv5_config, ADI_CONFIGURE_DAP_COMPULSORY);
+	if (e != JIM_CONTINUE)
+		return e;
+
+	if (goi->argc > 0) {
+		Jim_SetEmptyResult(goi->interp);
+
+		e = jim_nvp_name2value_obj(goi->interp, nvp_config_opts,
+				goi->argv[0], &n);
+		if (e != JIM_OK)
+			return JIM_CONTINUE;
+
+		e = jim_getopt_obj(goi, NULL);
+		if (e != JIM_OK)
+			return e;
+
+		switch (n->value) {
+		case CFG_CTI: {
+			if (goi->is_configure) {
+				Jim_Obj *o_cti;
+				struct arm_cti *cti;
+				e = jim_getopt_obj(goi, &o_cti);
+				if (e != JIM_OK)
+					return e;
+				cti = cti_instance_by_jim_obj(goi->interp, o_cti);
+				if (!cti) {
+					Jim_SetResultString(goi->interp, "CTI name invalid!", -1);
+					return JIM_ERR;
+				}
+				pc->cti = cti;
+			} else {
+				if (goi->argc != 0) {
+					Jim_WrongNumArgs(goi->interp,
+							goi->argc, goi->argv,
+							"NO PARAMS");
+					return JIM_ERR;
+				}
+
+				if (!pc || !pc->cti) {
+					Jim_SetResultString(goi->interp, "CTI not configured", -1);
+					return JIM_ERR;
+				}
+				Jim_SetResultString(goi->interp, arm_cti_name(pc->cti), -1);
+			}
+			break;
+		}
+
+		default:
+			return JIM_CONTINUE;
+		}
+	}
+
+	return JIM_OK;
 }
 
 COMMAND_HANDLER(cortex_a_handle_cache_info_command)
@@ -3494,7 +3588,7 @@ struct target_type cortexa_target = {
 
 	.commands = cortex_a_command_handlers,
 	.target_create = cortex_a_target_create,
-	.target_jim_configure = adiv5_jim_configure,
+	.target_jim_configure = cortex_a_jim_configure,
 	.init_target = cortex_a_init_target,
 	.examine = cortex_a_examine,
 	.deinit_target = cortex_a_deinit_target,
@@ -3571,7 +3665,7 @@ struct target_type cortexr4_target = {
 
 	.commands = cortex_r4_command_handlers,
 	.target_create = cortex_r4_target_create,
-	.target_jim_configure = adiv5_jim_configure,
+	.target_jim_configure = cortex_a_jim_configure,
 	.init_target = cortex_a_init_target,
 	.examine = cortex_a_examine,
 	.deinit_target = cortex_a_deinit_target,
