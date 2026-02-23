@@ -82,6 +82,34 @@ static int cortex_a_virt2phys(struct target *target,
 static int cortex_a_read_cpu_memory(struct target *target,
 	uint32_t address, uint32_t size, uint32_t count, uint8_t *buffer);
 
+static int cortex_a_init_cti(struct target *target)
+{
+	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
+	int retval;
+
+	if (!cortex_a->cti)
+		return ERROR_OK;
+
+	/*
+	 * Static CTI configuration:
+	 * Channel 0 -> trigger outputs HALT request to PE
+	 * Channel 1 -> trigger outputs Resume request to PE
+	 * Gate all channel trigger events from entering the CTM
+	 */
+	retval = arm_cti_enable(cortex_a->cti, true);
+	if (retval == ERROR_OK)
+		retval = arm_cti_write_reg(cortex_a->cti, CTI_GATE, 0);
+	if (retval == ERROR_OK)
+		retval = arm_cti_write_reg(cortex_a->cti, CTI_OUTEN0, CTI_CHNL(0));
+	if (retval == ERROR_OK)
+		retval = arm_cti_write_reg(cortex_a->cti, CTI_OUTEN1, CTI_CHNL(1));
+
+	if (retval != ERROR_OK)
+		LOG_TARGET_ERROR(target, "Failed to initialize CTI for SMP run-control");
+
+	return retval;
+}
+
 static unsigned int ilog2(unsigned int x)
 {
 	unsigned int y = 0;
@@ -3069,6 +3097,10 @@ static int cortex_a_examine_first(struct target *target)
 		LOG_TARGET_ERROR(target, "CTI not specified for SMP Cortex-R target");
 		return ERROR_FAIL;
 	}
+
+	retval = cortex_a_init_cti(target);
+	if (retval != ERROR_OK)
+		return retval;
 
 	retval = mem_ap_read_atomic_u32(armv7a->debug_ap,
 				    armv7a->debug_base + CPUDBG_PRSR, &dbg_osreg);
