@@ -1106,6 +1106,137 @@ static int cortex_a_internal_restart(struct target *target)
 	return ERROR_OK;
 }
 
+static int cortex_a_prepare_restart_one(struct target *target)
+{
+	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
+	struct armv7a_common *armv7a = target_to_armv7a(target);
+	uint32_t dscr;
+	int retval;
+
+	retval = mem_ap_read_atomic_u32(armv7a->debug_ap,
+			armv7a->debug_base + CPUDBG_DSCR, &dscr);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if ((dscr & DSCR_INSTR_COMP) == 0)
+		LOG_TARGET_ERROR(target, "DSCR InstrCompl must be set before leaving debug!");
+
+	retval = mem_ap_write_atomic_u32(armv7a->debug_ap,
+			armv7a->debug_base + CPUDBG_DSCR, dscr & ~DSCR_ITR_EN);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = arm_cti_ack_events(cortex_a->cti, CTI_TRIG(HALT));
+	if (retval == ERROR_OK)
+		retval = arm_cti_ungate_channel(cortex_a->cti, 1);
+	if (retval == ERROR_OK)
+		retval = arm_cti_gate_channel(cortex_a->cti, 0);
+
+	return retval;
+}
+
+static int cortex_a_restart_smp_group_cti(struct target *target,
+		struct target *initiator, bool exc_target)
+{
+	int retval;
+	int64_t then;
+	struct target_list *head;
+
+	if (!initiator)
+		return ERROR_OK;
+
+	retval = arm_cti_pulse_channel(target_to_cortex_a(initiator)->cti, 1);
+	if (retval != ERROR_OK)
+		return retval;
+
+	then = timeval_ms();
+	for (;;) {
+		bool all_resumed = true;
+
+		foreach_smp_target(head, target->smp_targets) {
+			struct target *curr = head->target;
+			uint32_t dscr;
+
+			if (exc_target && curr == target)
+				continue;
+			if (!target_was_examined(curr))
+				continue;
+			if (curr->state == TARGET_RUNNING)
+				continue;
+
+			retval = mem_ap_read_atomic_u32(target_to_armv7a(curr)->debug_ap,
+					target_to_armv7a(curr)->debug_base + CPUDBG_DSCR, &dscr);
+			if (retval != ERROR_OK)
+				return retval;
+
+			if ((dscr & DSCR_CORE_RESTARTED) == 0) {
+				all_resumed = false;
+				continue;
+			}
+
+			curr->debug_reason = DBG_REASON_NOTHALTED;
+			curr->state = TARGET_RUNNING;
+			register_cache_invalidate(target_to_armv7a(curr)->arm.core_cache);
+			if (curr != target)
+				target_call_event_callbacks(curr, TARGET_EVENT_RESUMED);
+		}
+
+		if (all_resumed)
+			return ERROR_OK;
+
+		if (timeval_ms() > then + 1000)
+			return ERROR_TARGET_TIMEOUT;
+	}
+}
+
+static int cortex_a_prep_restart_smp_cti(struct target *target,
+		bool handle_breakpoints, bool exc_target, struct target **p_first)
+{
+	int retval = ERROR_OK;
+	target_addr_t address;
+	struct target_list *head;
+	struct target *first = NULL;
+
+	foreach_smp_target(head, target->smp_targets) {
+		struct target *curr = head->target;
+
+		if (exc_target && curr == target)
+			continue;
+		if (!target_was_examined(curr))
+			continue;
+		if (curr->state != TARGET_HALTED)
+			continue;
+
+		if (curr != target)
+			retval = cortex_a_internal_restore(curr, true, &address,
+					handle_breakpoints, false);
+		if (retval == ERROR_OK)
+			retval = cortex_a_prepare_restart_one(curr);
+		if (retval != ERROR_OK)
+			return retval;
+
+		if (!first)
+			first = curr;
+	}
+
+	if (p_first)
+		*p_first = first;
+
+	return ERROR_OK;
+}
+
+static int cortex_a_step_restart_smp_cti(struct target *target)
+{
+	int retval;
+	struct target *first = NULL;
+
+	retval = cortex_a_prep_restart_smp_cti(target, false, true, &first);
+	if (retval != ERROR_OK)
+		return retval;
+
+	return cortex_a_restart_smp_group_cti(target, first, true);
+}
+
 static int cortex_a_restore_smp(struct target *target, bool handle_breakpoints)
 {
 	int retval = ERROR_OK;
@@ -1146,15 +1277,32 @@ static int cortex_a_resume(struct target *target, bool current,
 		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
 		return 0;
 	}
-	cortex_a_internal_restore(target, current, &address, handle_breakpoints,
+	retval = cortex_a_internal_restore(target, current, &address, handle_breakpoints,
 		debug_execution);
+	if (retval != ERROR_OK)
+		return retval;
 	if (target->smp) {
 		target->gdb_service->core[0] = -1;
-		retval = cortex_a_restore_smp(target, handle_breakpoints);
+		if (cortex_a_smp_cti_active(target)) {
+			retval = cortex_a_prep_restart_smp_cti(target, handle_breakpoints,
+					true, NULL);
+			if (retval == ERROR_OK)
+				retval = cortex_a_prepare_restart_one(target);
+			if (retval == ERROR_OK)
+				retval = cortex_a_restart_smp_group_cti(target, target, false);
+			if (retval != ERROR_OK)
+				return retval;
+		} else {
+			retval = cortex_a_restore_smp(target, handle_breakpoints);
+			if (retval != ERROR_OK)
+				return retval;
+		}
+	}
+	if (!cortex_a_smp_cti_active(target)) {
+		retval = cortex_a_internal_restart(target);
 		if (retval != ERROR_OK)
 			return retval;
 	}
-	cortex_a_internal_restart(target);
 
 	if (!debug_execution) {
 		target->state = TARGET_RUNNING;
@@ -1390,12 +1538,30 @@ static int cortex_a_step(struct target *target, bool current, target_addr_t addr
 			return retval;
 	}
 
+	if (target->smp && current && cortex_a_smp_cti_active(target)) {
+		retval = arm_cti_gate_channel(cortex_a->cti, 1);
+		if (retval == ERROR_OK)
+			retval = cortex_a_step_restart_smp_cti(target);
+		if (retval != ERROR_OK) {
+			LOG_TARGET_ERROR(target,
+				"Failed to restart non-stepping targets in SMP group");
+			return retval;
+		}
+	}
+
 	/* Break on IVA mismatch */
 	cortex_a_set_breakpoint(target, &stepbreakpoint, 0x04);
 
 	target->debug_reason = DBG_REASON_SINGLESTEP;
 
-	retval = cortex_a_resume(target, true, address, false, false);
+	if (target->smp && current && cortex_a_smp_cti_active(target)) {
+		int saved_smp = target->smp;
+		target->smp = 0;
+		retval = cortex_a_resume(target, true, address, false, false);
+		target->smp = saved_smp;
+	} else {
+		retval = cortex_a_resume(target, true, address, false, false);
+	}
 	if (retval != ERROR_OK)
 		return retval;
 
