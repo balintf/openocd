@@ -741,6 +741,9 @@ static int cortex_a_prepare_halt_smp_cti(struct target *target,
 		if (retval != ERROR_OK)
 			break;
 
+		LOG_TARGET_DEBUG(curr,
+			"CTI halt prep: ungate CH0 (halt), gate CH1 (restart)");
+
 		if (!first)
 			first = curr;
 	}
@@ -765,9 +768,13 @@ static int cortex_a_halt_smp_cti(struct target *target, bool exc_target)
 	if (retval != ERROR_OK)
 		return retval;
 
-	if (exc_target && initiator == target)
+	if (exc_target && initiator == target) {
+		LOG_TARGET_DEBUG(target,
+			"CTI halt skipped: no eligible SMP peer targets are running");
 		return ERROR_OK;
+	}
 
+	LOG_TARGET_DEBUG(initiator, "CTI halt pulse on CH0");
 	retval = arm_cti_pulse_channel(target_to_cortex_a(initiator)->cti, 0);
 	if (retval != ERROR_OK)
 		return retval;
@@ -802,8 +809,11 @@ static int cortex_a_halt_smp_cti(struct target *target, bool exc_target)
 		if (all_halted)
 			return ERROR_OK;
 
-		if (timeval_ms() > then + 1000)
+		if (timeval_ms() > then + 1000) {
+			LOG_TARGET_DEBUG(target,
+				"CTI halt convergence timeout after 1000 ms");
 			return ERROR_TARGET_TIMEOUT;
+		}
 	}
 }
 
@@ -859,10 +869,13 @@ static int update_halt_gdb(struct target *target)
 	if (target->gdb_service && target->gdb_service->core[0] == -1) {
 		target->gdb_service->target = target;
 		target->gdb_service->core[0] = target->coreid;
-		if (cortex_a_smp_cti_active(target))
+		if (cortex_a_smp_cti_active(target)) {
+			LOG_TARGET_DEBUG(target, "SMP halt using CTI-assisted group halt path");
 			retval += cortex_a_halt_smp_cti(target, true);
-		else
+		} else {
+			LOG_TARGET_DEBUG(target, "SMP halt using legacy per-core halt path");
 			retval += cortex_a_halt_smp(target);
+		}
 	}
 
 	if (target->gdb_service)
@@ -1172,6 +1185,9 @@ static int cortex_a_prepare_restart_one(struct target *target)
 		retval = arm_cti_ungate_channel(cortex_a->cti, 1);
 	if (retval == ERROR_OK)
 		retval = arm_cti_gate_channel(cortex_a->cti, 0);
+	if (retval == ERROR_OK)
+		LOG_TARGET_DEBUG(target,
+			"CTI restart prep: ack HALT, ungate CH1 (restart), gate CH0 (halt)");
 
 	return retval;
 }
@@ -1186,6 +1202,7 @@ static int cortex_a_restart_smp_group_cti(struct target *target,
 	if (!initiator)
 		return ERROR_OK;
 
+	LOG_TARGET_DEBUG(initiator, "CTI restart pulse on CH1");
 	retval = arm_cti_pulse_channel(target_to_cortex_a(initiator)->cti, 1);
 	if (retval != ERROR_OK)
 		return retval;
@@ -1225,8 +1242,11 @@ static int cortex_a_restart_smp_group_cti(struct target *target,
 		if (all_resumed)
 			return ERROR_OK;
 
-		if (timeval_ms() > then + 1000)
+		if (timeval_ms() > then + 1000) {
+			LOG_TARGET_DEBUG(target,
+				"CTI restart convergence timeout after 1000 ms");
 			return ERROR_TARGET_TIMEOUT;
+		}
 	}
 }
 
@@ -1325,6 +1345,7 @@ static int cortex_a_resume(struct target *target, bool current,
 	if (target->smp) {
 		target->gdb_service->core[0] = -1;
 		if (cortex_a_smp_cti_active(target)) {
+			LOG_TARGET_DEBUG(target, "SMP resume using CTI-synchronized restart path");
 			retval = cortex_a_prep_restart_smp_cti(target, handle_breakpoints,
 					true, NULL);
 			if (retval == ERROR_OK)
@@ -1334,6 +1355,7 @@ static int cortex_a_resume(struct target *target, bool current,
 			if (retval != ERROR_OK)
 				return retval;
 		} else {
+			LOG_TARGET_DEBUG(target, "SMP resume using legacy per-core restart path");
 			retval = cortex_a_restore_smp(target, handle_breakpoints);
 			if (retval != ERROR_OK)
 				return retval;

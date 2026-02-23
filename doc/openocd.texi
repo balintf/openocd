@@ -1819,6 +1819,30 @@ target create $_TARGETNAME_2 cortex_a -chain-position $_CHIPNAME.dap \
 target smp $_CHIPNAME.cpu2 $_CHIPNAME.cpu1
 @end example
 In the above example on cortex_a, 2 cpus are working in SMP.
+
+For Cortex-R5 SMP targets, create one CTI instance per core and bind each CPU
+target with @code{-cti}. When CTI is configured, Cortex-R SMP uses channel 0 for
+halt fan-out and channel 1 for synchronized resume.
+
+@example
+# AM2434 example: one CTI per R5 core, then SMP groups per dual-core cluster
+cti create $_CHIPNAME.cti.main0_r5.0 -dap $_CHIPNAME.dap -ap-num 5 -baseaddr 0x9d418000
+cti create $_CHIPNAME.cti.main0_r5.1 -dap $_CHIPNAME.dap -ap-num 5 -baseaddr 0x9d419000
+cti create $_CHIPNAME.cti.main1_r5.0 -dap $_CHIPNAME.dap -ap-num 5 -baseaddr 0x9d518000
+cti create $_CHIPNAME.cti.main1_r5.1 -dap $_CHIPNAME.dap -ap-num 5 -baseaddr 0x9d519000
+
+target create $_CHIPNAME.main0_r5.0 cortex_r4 -dap $_CHIPNAME.dap -ap-num 5 	-dbgbase 0x9d410000 -coreid 0 -cti $_CHIPNAME.cti.main0_r5.0
+
+target create $_CHIPNAME.main0_r5.1 cortex_r4 -dap $_CHIPNAME.dap -ap-num 5 	-dbgbase 0x9d412000 -coreid 1 -cti $_CHIPNAME.cti.main0_r5.1
+
+target create $_CHIPNAME.main1_r5.0 cortex_r4 -dap $_CHIPNAME.dap -ap-num 5 	-dbgbase 0x9d510000 -coreid 2 -cti $_CHIPNAME.cti.main1_r5.0
+
+target create $_CHIPNAME.main1_r5.1 cortex_r4 -dap $_CHIPNAME.dap -ap-num 5 	-dbgbase 0x9d512000 -coreid 3 -cti $_CHIPNAME.cti.main1_r5.1
+
+target smp $_CHIPNAME.main0_r5.0 $_CHIPNAME.main0_r5.1
+target smp $_CHIPNAME.main1_r5.0 $_CHIPNAME.main1_r5.1
+@end example
+
 In SMP only one GDB instance is created and :
 @itemize @bullet
 @item a set of hardware breakpoint sets the same breakpoint on all targets in the list.
@@ -5414,8 +5438,10 @@ To avoid confusion, these additional use cases are going to be dropped.
 @end itemize
 
 @item @code{-cti} @var{cti_name} -- set Cross-Trigger Interface (CTI) connected
-to the target. Currently, only the @code{aarch64} target makes use of this option,
-where it is a mandatory configuration for the target run control.
+to the target. The option is used by @code{aarch64} and by @code{cortex_a}
+when debugging ARMv7-R targets (for example Cortex-R4/R5).
+For Cortex-R SMP run control, CTI channel 0 is used as the group halt trigger and
+CTI channel 1 is used as the synchronized restart trigger.
 @xref{armcrosstrigger,,ARM Cross-Trigger Interface},
 for instruction on how to declare and control a CTI instance.
 
