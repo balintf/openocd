@@ -707,6 +707,106 @@ static struct target *get_cortex_a(struct target *target, int32_t coreid)
 }
 static int cortex_a_halt(struct target *target);
 
+static bool cortex_a_smp_cti_active(struct target *target)
+{
+	struct cortex_a_common *cortex_a = target_to_cortex_a(target);
+
+	return target->smp && cortex_a->cti;
+}
+
+static int cortex_a_prepare_halt_smp_cti(struct target *target,
+		bool exc_target, struct target **p_first)
+{
+	int retval = ERROR_OK;
+	struct target_list *head;
+	struct target *first = NULL;
+
+	foreach_smp_target(head, target->smp_targets) {
+		struct target *curr = head->target;
+		struct cortex_a_common *cortex_a = target_to_cortex_a(curr);
+
+		if (exc_target && curr == target)
+			continue;
+		if (!target_was_examined(curr))
+			continue;
+		if (curr->state != TARGET_RUNNING)
+			continue;
+
+		/* HACK: mark this target as prepared for halting */
+		curr->debug_reason = DBG_REASON_DBGRQ;
+
+		retval = arm_cti_ungate_channel(cortex_a->cti, 0);
+		if (retval == ERROR_OK)
+			retval = arm_cti_gate_channel(cortex_a->cti, 1);
+		if (retval != ERROR_OK)
+			break;
+
+		if (!first)
+			first = curr;
+	}
+
+	if (p_first) {
+		if (exc_target && first)
+			*p_first = first;
+		else
+			*p_first = target;
+	}
+
+	return retval;
+}
+
+static int cortex_a_halt_smp_cti(struct target *target, bool exc_target)
+{
+	struct target *initiator = target;
+	int retval;
+	int64_t then;
+
+	retval = cortex_a_prepare_halt_smp_cti(target, exc_target, &initiator);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (exc_target && initiator == target)
+		return ERROR_OK;
+
+	retval = arm_cti_pulse_channel(target_to_cortex_a(initiator)->cti, 0);
+	if (retval != ERROR_OK)
+		return retval;
+
+	then = timeval_ms();
+	for (;;) {
+		bool all_halted = true;
+		struct target_list *head;
+
+		foreach_smp_target(head, target->smp_targets) {
+			struct target *curr = head->target;
+			uint32_t dscr;
+
+			if (exc_target && curr == target)
+				continue;
+			if (!target_was_examined(curr))
+				continue;
+			if (curr->state == TARGET_HALTED)
+				continue;
+
+			retval = mem_ap_read_atomic_u32(target_to_armv7a(curr)->debug_ap,
+					target_to_armv7a(curr)->debug_base + CPUDBG_DSCR, &dscr);
+			if (retval != ERROR_OK)
+				return retval;
+
+			if (DSCR_RUN_MODE(dscr) != (DSCR_CORE_HALTED | DSCR_CORE_RESTARTED)) {
+				all_halted = false;
+				break;
+			}
+		}
+
+		if (all_halted)
+			return ERROR_OK;
+
+		if (timeval_ms() > then + 1000)
+			return ERROR_TARGET_TIMEOUT;
+	}
+}
+
 static int cortex_a_halt_smp(struct target *target)
 {
 	int retval = 0;
@@ -731,7 +831,10 @@ static int update_halt_gdb(struct target *target)
 	if (target->gdb_service && target->gdb_service->core[0] == -1) {
 		target->gdb_service->target = target;
 		target->gdb_service->core[0] = target->coreid;
-		retval += cortex_a_halt_smp(target);
+		if (cortex_a_smp_cti_active(target))
+			retval += cortex_a_halt_smp_cti(target, true);
+		else
+			retval += cortex_a_halt_smp(target);
 	}
 
 	if (target->gdb_service)
@@ -829,6 +932,9 @@ static int cortex_a_halt(struct target *target)
 	int retval;
 	uint32_t dscr;
 	struct armv7a_common *armv7a = target_to_armv7a(target);
+
+	if (cortex_a_smp_cti_active(target))
+		return cortex_a_halt_smp_cti(target, false);
 
 	/*
 	 * Tell the core to be halted by writing DRCR with 0x1
