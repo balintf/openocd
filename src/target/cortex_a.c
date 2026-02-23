@@ -821,6 +821,34 @@ static int cortex_a_halt_smp(struct target *target)
 	return retval;
 }
 
+enum cortex_a_postponed_halt_events_op {
+	CORTEX_A_POSTPONED_HALT_EVENT_CLEAR,
+	CORTEX_A_POSTPONED_HALT_EVENT_EMIT
+};
+
+static void cortex_a_smp_postponed_halt_events(struct list_head *smp_targets,
+		enum cortex_a_postponed_halt_events_op op)
+{
+	struct target_list *head;
+
+	foreach_smp_target(head, smp_targets) {
+		struct target *curr = head->target;
+
+		if (!curr->smp_halt_event_postponed)
+			continue;
+
+		if (op == CORTEX_A_POSTPONED_HALT_EVENT_EMIT) {
+			LOG_TARGET_DEBUG(curr, "sending postponed target event 'halted'");
+			target_call_event_callbacks(curr, TARGET_EVENT_HALTED);
+		}
+
+		curr->smp_halt_event_postponed = false;
+	}
+}
+
+static int cortex_a_poll_smp(struct target *target, bool smp,
+		bool postpone_event);
+
 static int update_halt_gdb(struct target *target)
 {
 	struct target *gdb_target = NULL;
@@ -854,15 +882,12 @@ static int update_halt_gdb(struct target *target)
 		if (curr == gdb_target)
 			continue;
 
-		/* avoid recursion in cortex_a_poll() */
-		curr->smp = 0;
-		cortex_a_poll(curr);
-		curr->smp = 1;
+		cortex_a_poll_smp(curr, false, true);
 	}
 
 	/* after all targets were updated, poll the gdb serving target */
 	if (gdb_target && gdb_target != target)
-		cortex_a_poll(gdb_target);
+		cortex_a_poll_smp(gdb_target, false, true);
 	return retval;
 }
 
@@ -870,7 +895,8 @@ static int update_halt_gdb(struct target *target)
  * Cortex-A Run control
  */
 
-static int cortex_a_poll(struct target *target)
+static int cortex_a_poll_smp(struct target *target, bool smp,
+		bool postpone_event)
 {
 	int retval = ERROR_OK;
 	uint32_t dscr;
@@ -881,7 +907,7 @@ static int cortex_a_poll(struct target *target)
 	/*  maint packet J core_id */
 	/*  continue */
 	/*  the next polling trigger an halt event sent to gdb */
-	if ((target->state == TARGET_HALTED) && (target->smp) &&
+	if ((target->state == TARGET_HALTED) && smp &&
 		(target->gdb_service) &&
 		(!target->gdb_service->target)) {
 		target->gdb_service->target =
@@ -905,7 +931,7 @@ static int cortex_a_poll(struct target *target)
 			if (retval != ERROR_OK)
 				return retval;
 
-			if (target->smp) {
+			if (smp) {
 				retval = update_halt_gdb(target);
 				if (retval != ERROR_OK)
 					return retval;
@@ -914,17 +940,32 @@ static int cortex_a_poll(struct target *target)
 			if (prev_target_state == TARGET_DEBUG_RUNNING) {
 				target_call_event_callbacks(target, TARGET_EVENT_DEBUG_HALTED);
 			} else { /* prev_target_state is RUNNING, UNKNOWN or RESET */
-				if (arm_semihosting(target, &retval) != 0)
+				if (arm_semihosting(target, &retval) != 0) {
+					if (smp)
+						cortex_a_smp_postponed_halt_events(target->smp_targets,
+							CORTEX_A_POSTPONED_HALT_EVENT_CLEAR);
 					return retval;
+				}
 
-				target_call_event_callbacks(target,
-					TARGET_EVENT_HALTED);
+				if (postpone_event)
+					target->smp_halt_event_postponed = true;
+				else
+					target_call_event_callbacks(target, TARGET_EVENT_HALTED);
 			}
+
+			if (smp)
+				cortex_a_smp_postponed_halt_events(target->smp_targets,
+					CORTEX_A_POSTPONED_HALT_EVENT_EMIT);
 		}
 	} else
 		target->state = TARGET_RUNNING;
 
 	return retval;
+}
+
+static int cortex_a_poll(struct target *target)
+{
+	return cortex_a_poll_smp(target, target->smp != 0, false);
 }
 
 static int cortex_a_halt(struct target *target)
